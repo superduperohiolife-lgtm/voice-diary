@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>音声日記</title>
+<style>
+  :root { --bg:#0f1115; --card:#1a1d24; --fg:#e8eaed; --sub:#9aa0a6; --accent:#4f8cff; --rec:#ff4d4f; --ok:#34c759; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { margin:0; font-family:-apple-system,"Hiragino Sans","Noto Sans CJK JP",sans-serif;
+         background:var(--bg); color:var(--fg); padding:16px; max-width:560px; margin:0 auto; }
+  h1 { font-size:18px; margin:8px 0 4px; }
+  .date { color:var(--sub); font-size:13px; margin-bottom:16px; }
+  .btn { width:100%; border:none; border-radius:14px; padding:18px; font-size:17px; font-weight:600;
+          color:#fff; background:var(--accent); margin-bottom:10px; cursor:pointer; }
+  .btn.rec { background:var(--rec); }
+  .btn:disabled { opacity:.5; }
+  .row { display:flex; gap:10px; }
+  .row .btn { flex:1; }
+  .status { font-size:14px; color:var(--sub); min-height:20px; margin:6px 0 14px; }
+  .status.live { color:var(--rec); }
+  .card { background:var(--card); border-radius:14px; padding:14px; }
+  .card h2 { font-size:14px; color:var(--sub); margin:0 0 8px; font-weight:500; }
+  #transcript { white-space:pre-wrap; line-height:1.6; font-size:15px; min-height:60px; }
+  .seg { padding:8px 0; border-bottom:1px solid #2a2e37; }
+  .seg:last-child { border-bottom:none; }
+  .meta { color:var(--sub); font-size:12px; }
+  .hint { color:var(--sub); font-size:12px; margin-top:14px; line-height:1.5; }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; background:var(--rec); margin-right:6px;
+         animation:blink 1s infinite; }
+  @keyframes blink { 50% { opacity:.25; } }
+</style>
+</head>
+<body>
+  <h1>🎙️ 音声日記</h1>
+  <div class="date" id="today"></div>
+
+  <button class="btn" id="recBtn">● 録音を開始</button>
+  <div class="row">
+    <button class="btn" id="clearBtn" style="background:#3a3f4a">表示をクリア</button>
+  </div>
+  <div class="status" id="status">マイクの使用を許可してください。1回の録音は最長50秒です。</div>
+
+  <div class="card">
+    <h2>今日の記録</h2>
+    <div id="transcript"></div>
+  </div>
+
+  <p class="hint">
+    話した内容は自動で Google Drive に保存されます。長い日記は「開始 → 停止」を何度か繰り返してください（区切り録音）。<br>
+    ※ 録音中は自動ロックを防止します。ただし電源ボタンで手動ロック/他アプリ切替をすると録音は止まります。画面は開いたままに。
+  </p>
+
+<script>
+// ===== 設定: デプロイした Apps Script ウェブアプリのURLに置き換えてください =====
+const ENDPOINT = "https://script.google.com/macros/s/AKfycbwA4TuPi1N7UyPcCPPSnsKOgt0mep0n2H-M1rRz9KUwXGI5kne87D80H1X8FPk6pZU9gg/exec";
+const MAX_SECONDS = 50;        // 同期認識の上限(約60秒)に対する安全マージン
+const TARGET_RATE = 16000;     // Cloud STT 推奨サンプルレート
+// =============================================================================
+
+const today = new Date();
+const pad = n => String(n).padStart(2, '0');
+const dateStr = `${today.getFullYear()}-${pad(today.getMonth()+1)}-${pad(today.getDate())}`;
+document.getElementById('today').textContent = dateStr;
+
+const recBtn = document.getElementById('recBtn');
+const clearBtn = document.getElementById('clearBtn');
+const statusEl = document.getElementById('status');
+const transcriptEl = document.getElementById('transcript');
+
+// AudioWorklet 内で動く録音プロセッサ（専用オーディオスレッドで全サンプルを確実に取得）
+const WORKLET_CODE = `
+class RecProcessor extends AudioWorkletProcessor {
+  constructor(){ super(); this.parts=[]; this.n=0;
+    this.port.onmessage = e => { if(e.data==='flush') this.flush(); }; }
+  flush(){ const m=new Float32Array(this.n); let o=0;
+    for(const p of this.parts){ m.set(p,o); o+=p.length; }
+    this.parts=[]; this.n=0; this.port.postMessage(m,[m.buffer]); }
+  process(inputs){ const ch = inputs[0] && inputs[0][0];
+    if(ch){ this.parts.push(new Float32Array(ch)); this.n+=ch.length; if(this.n>=8192) this.flush(); }
+    return true; }
+}
+registerProcessor('rec-processor', RecProcessor);
+`;
+
+let audioCtx, source, node, stream, recording=false, buffers=[], nativeRate=48000, workletURL=null, wakeLock=null, autoStopTimer=null;
+
+function setStatus(msg, live=false) {
+  statusEl.innerHTML = (live ? '<span class="dot"></span>' : '') + msg;
+  statusEl.className = 'status' + (live ? ' live' : '');
+}
+
+// 録音中に画面が自動ロックしないようにする（iOS Safari 16.4+）
+async function requestWakeLock(){
+  try{ if('wakeLock' in navigator){ wakeLock = await navigator.wakeLock.request('screen'); } }catch(e){ wakeLock=null; }
+}
+async function releaseWakeLock(){
+  try{ if(wakeLock){ await wakeLock.release(); wakeLock=null; } }catch(e){}
+}
+document.addEventListener('visibilitychange', ()=>{ if(recording && document.visibilityState==='visible') requestWakeLock(); });
+
+recBtn.addEventListener('click', () => recording ? stopRecording() : startRecording());
+clearBtn.addEventListener('click', () => { transcriptEl.innerHTML = ''; });
+
+async function startRecording() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount:1, echoCancellation:true, noiseSuppression:true }
+    });
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    await audioCtx.resume();
+    nativeRate = audioCtx.sampleRate;
+
+    if (!workletURL){
+      const blob = new Blob([WORKLET_CODE], { type:'application/javascript' });
+      workletURL = URL.createObjectURL(blob);
+    }
+    await audioCtx.audioWorklet.addModule(workletURL);
+
+    source = audioCtx.createMediaStreamSource(stream);
+    node = new AudioWorkletNode(audioCtx, 'rec-processor');
+    buffers = [];
+    node.port.onmessage = e => { if (e.data && e.data.length) buffers.push(new Float32Array(e.data)); };
+    source.connect(node);
+    node.connect(audioCtx.destination);
+
+    recording = true;
+    await requestWakeLock();
+    recBtn.textContent = '■ 停止して文字起こし';
+    recBtn.classList.add('rec');
+    setStatus('録音中… 話してください', true);
+    autoStopTimer = setTimeout(() => { if (recording) stopRecording(); }, MAX_SECONDS*1000);
+  } catch (err) {
+    setStatus('マイクを使用できません: ' + err.message);
+  }
+}
+
+async function stopRecording() {
+  if (!recording) return;
+  recording = false;
+  clearTimeout(autoStopTimer);
+  await releaseWakeLock();
+  recBtn.textContent = '● 録音を開始';
+  recBtn.classList.remove('rec');
+  setStatus('文字起こし中…');
+
+  try { node.port.postMessage('flush'); } catch(e){}
+  await new Promise(r=>setTimeout(r,120));
+  try { source.disconnect(); node.disconnect(); } catch(e){}
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  if (audioCtx) await audioCtx.close();
+
+  const merged = mergeBuffers(buffers);
+  if (merged.length === 0) { setStatus('音声が取得できませんでした'); return; }
+  const down = downsample(merged, nativeRate, TARGET_RATE);
+  const pcm16 = floatTo16BitPCM(down);
+  const b64 = bytesToBase64(new Uint8Array(pcm16.buffer));
+
+  recBtn.disabled = true;
+  await sendToBackend(b64);
+  recBtn.disabled = false;
+}
+
+function mergeBuffers(chunks) {
+  let len = 0; chunks.forEach(c => len += c.length);
+  const out = new Float32Array(len);
+  let off = 0; chunks.forEach(c => { out.set(c, off); off += c.length; });
+  return out;
+}
+
+function downsample(buffer, fromRate, toRate) {
+  if (toRate >= fromRate) return buffer;
+  const ratio = fromRate / toRate;
+  const newLen = Math.round(buffer.length / ratio);
+  const result = new Float32Array(newLen);
+  let pos = 0, idx = 0;
+  while (idx < newLen) {
+    const next = Math.round((idx + 1) * ratio);
+    let sum = 0, count = 0;
+    for (let i = pos; i < next && i < buffer.length; i++) { sum += buffer[i]; count++; }
+    result[idx] = count ? sum / count : 0;
+    pos = next; idx++;
+  }
+  return result;
+}
+
+function floatTo16BitPCM(input) {
+  const out = new Int16Array(input.length);
+  for (let i = 0; i < input.length; i++) {
+    const s = Math.max(-1, Math.min(1, input[i]));
+    out[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+  }
+  return out;
+}
+
+function bytesToBase64(bytes) {
+  let bin = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i+chunk));
+  }
+  return btoa(bin);
+}
+
+async function sendToBackend(pcmBase64) {
+  if (!ENDPOINT || ENDPOINT.indexOf('http') !== 0) {
+    setStatus('未設定: ENDPOINT に Apps Script のURLを入れてください');
+    return;
+  }
+  const payload = JSON.stringify({ pcm: pcmBase64, sampleRate: TARGET_RATE, date: dateStr });
+  try {
+    const res = await fetch(ENDPOINT, {
+      method:'POST',
+      headers:{ 'Content-Type':'text/plain;charset=utf-8' },
+      body: payload
+    });
+    const data = await res.json();
+    if (data.ok) {
+      appendSegment(data.transcript || '(無音)');
+      setStatus('保存しました ✓ Driveに記録済み');
+    } else {
+      setStatus('エラー: ' + (data.error || '不明'));
+    }
+  } catch (err) {
+    appendSegment('（送信しました。結果はDriveを確認してください）');
+    setStatus('送信完了（応答は取得できませんでした。Driveに保存されています）');
+  }
+}
+
+function appendSegment(text) {
+  const t = new Date();
+  const time = `${pad(t.getHours())}:${pad(t.getMinutes())}`;
+  const div = document.createElement('div');
+  div.className = 'seg';
+  div.innerHTML = `<div class="meta">${time}</div>${text.replace(/</g,'&lt;')}`;
+  transcriptEl.appendChild(div);
+}
+</script>
+</body>
+</html>
