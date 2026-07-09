@@ -30,8 +30,8 @@
 <body>
   <h1>🎓 音声日記 トレーニング</h1>
   <p class="lead">
-    ①（任意）「文脈メモ」に話す話題・固有名詞などを書く → ②「録音開始」で自由に話す（1回最長50秒。長ければ停止→開始で区切り）→ ③「STT生結果」に素の認識が貯まる → ④「引き継ぎ用にコピー」でチャットへ貼る → 私とあなたで校正し、誤り→正しい表記を一括抽出します。<br>
-    ※ このページはGemini補正・置換・Drive保存を通さない“素のSTT”です。
+    ①（任意）「文脈メモ」に話す話題・固有名詞などを書く → ②「録音開始」で自由に話す（1回最長50秒。長ければ停止→開始で区切り）→ ③「生STT結果」に素の認識、「辞書適用後」に本番と同じ補正結果が貯まる → ④「引き継ぎ用にコピー」でチャットへ貼る → 生から新しい誤り→正を抽出し、適用後で残存誤りを検証します。<br>
+    ※ 「辞書適用後」は本番と同一処理（Gemini補正＋置換）。検証用のためDrive保存はしません。
   </p>
 
   <label>文脈メモ（任意）：話題・固有名詞など。私の校正精度が上がります</label>
@@ -40,8 +40,11 @@
   <button class="btn" id="recBtn">● 録音開始</button>
   <div class="status" id="status">マイク許可後、元テキストを読み上げてください。</div>
 
-  <label>STT生結果（区切り録音で追記されます）</label>
-  <textarea id="raw" rows="6" placeholder="ここに素のSTT結果が貯まります"></textarea>
+  <label>生STT結果（補正なし・区切り録音で追記）</label>
+  <textarea id="raw" rows="5" placeholder="ここに素のSTT結果が貯まります"></textarea>
+
+  <label>辞書適用後（本番と同じ Gemini補正＋置換）</label>
+  <textarea id="fixed" rows="5" placeholder="ここに辞書適用後の結果が貯まります。残る誤りがあれば校正対象"></textarea>
 
   <div class="row">
     <button class="btn sub" id="copyBtn">📋 引き継ぎ用にコピー</button>
@@ -57,6 +60,7 @@ const TARGET_RATE = 16000;
 const recBtn = document.getElementById('recBtn');
 const statusEl = document.getElementById('status');
 const rawEl = document.getElementById('raw');
+const fixedEl = document.getElementById('fixed');
 const srcEl = document.getElementById('src');
 
 const WORKLET_CODE = `
@@ -83,9 +87,11 @@ async function releaseWakeLock(){ try{ if(wakeLock){ await wakeLock.release(); w
 document.addEventListener('visibilitychange', ()=>{ if(recording && document.visibilityState==='visible') requestWakeLock(); });
 
 recBtn.addEventListener('click', ()=> recording ? stopRec() : startRec());
-document.getElementById('clearBtn').addEventListener('click', ()=>{ rawEl.value=''; });
+document.getElementById('clearBtn').addEventListener('click', ()=>{ rawEl.value=''; fixedEl.value=''; });
 document.getElementById('copyBtn').addEventListener('click', ()=>{
-  const text = '【文脈メモ】\n' + srcEl.value.trim() + '\n\n【STT生結果】\n' + rawEl.value.trim();
+  const text = '【文脈メモ】\n' + srcEl.value.trim() +
+               '\n\n【STT生結果】\n' + rawEl.value.trim() +
+               '\n\n【辞書適用後】\n' + fixedEl.value.trim();
   navigator.clipboard.writeText(text).then(()=> setStatus('コピーしました。チャットに貼り付けてください', 'ok'),
     ()=> setStatus('コピーに失敗。手動で選択してコピーしてください'));
 });
@@ -133,10 +139,11 @@ async function stopRec(){
 async function sendRaw(pcmBase64){
   try{
     const res = await fetch(ENDPOINT, { method:'POST', headers:{ 'Content-Type':'text/plain;charset=utf-8' },
-      body: JSON.stringify({ pcm: pcmBase64, sampleRate: TARGET_RATE, mode:'raw' }) });
+      body: JSON.stringify({ pcm: pcmBase64, sampleRate: TARGET_RATE, mode:'both' }) });
     const data = await res.json();
     if(data.ok){
-      rawEl.value = (rawEl.value ? rawEl.value.trim()+' ' : '') + (data.transcript||'');
+      rawEl.value   = (rawEl.value   ? rawEl.value.trim()+' '   : '') + (data.raw||'');
+      fixedEl.value = (fixedEl.value ? fixedEl.value.trim()+' ' : '') + (data.transcript||'');
       setStatus('認識完了 ✓ 続きは再度「録音開始」', 'ok');
     } else { setStatus('エラー: ' + (data.error||'不明')); }
   }catch(err){ setStatus('送信失敗: ' + err.message); }
