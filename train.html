@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>音声日記 トレーニング</title>
+<style>
+  :root { --bg:#0f1115; --card:#1a1d24; --fg:#e8eaed; --sub:#9aa0a6; --accent:#4f8cff; --rec:#ff4d4f; --ok:#34c759; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { margin:0; font-family:-apple-system,"Hiragino Sans","Noto Sans CJK JP",sans-serif;
+         background:var(--bg); color:var(--fg); padding:16px; max-width:600px; margin:0 auto; }
+  h1 { font-size:18px; margin:8px 0 2px; }
+  .lead { color:var(--sub); font-size:12px; line-height:1.6; margin-bottom:14px; }
+  label { display:block; font-size:12px; color:var(--sub); margin:12px 0 4px; }
+  textarea { width:100%; background:var(--card); color:var(--fg); border:1px solid #2a2e37; border-radius:12px;
+             padding:12px; font-size:14px; line-height:1.6; font-family:inherit; resize:vertical; }
+  .btn { width:100%; border:none; border-radius:14px; padding:16px; font-size:16px; font-weight:600;
+          color:#fff; background:var(--accent); margin:10px 0 4px; cursor:pointer; }
+  .btn.rec { background:var(--rec); }
+  .btn.sub { background:#2a2e37; }
+  .btn:disabled { opacity:.5; }
+  .row { display:flex; gap:10px; } .row .btn { flex:1; }
+  .status { font-size:13px; color:var(--sub); min-height:20px; margin:6px 0; }
+  .status.live { color:var(--rec); } .status.ok { color:var(--ok); }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; background:var(--rec); margin-right:6px; animation:blink 1s infinite; }
+  @keyframes blink { 50% { opacity:.25; } }
+</style>
+</head>
+<body>
+  <h1>🎓 音声日記 トレーニング</h1>
+  <p class="lead">
+    ①（任意）「文脈メモ」に話す話題・固有名詞などを書く → ②「録音開始」で自由に話す（1回最長50秒。長ければ停止→開始で区切り）→ ③「STT生結果」に素の認識が貯まる → ④「引き継ぎ用にコピー」でチャットへ貼る → 私とあなたで校正し、誤り→正しい表記を一括抽出します。<br>
+    ※ このページはGemini補正・置換・Drive保存を通さない“素のSTT”です。
+  </p>
+
+  <label>文脈メモ（任意）：話題・固有名詞など。私の校正精度が上がります</label>
+  <textarea id="src" rows="3" placeholder="例）QCT初出社、武藤部長、NAQ、重品（重要品質問題）… など今日の話題や固有名詞"></textarea>
+
+  <button class="btn" id="recBtn">● 録音開始</button>
+  <div class="status" id="status">マイク許可後、元テキストを読み上げてください。</div>
+
+  <label>STT生結果（区切り録音で追記されます）</label>
+  <textarea id="raw" rows="6" placeholder="ここに素のSTT結果が貯まります"></textarea>
+
+  <div class="row">
+    <button class="btn sub" id="copyBtn">📋 引き継ぎ用にコピー</button>
+    <button class="btn sub" id="clearBtn">STT結果をクリア</button>
+  </div>
+
+<script>
+// index.html と同じ Apps Script Web アプリ URL
+const ENDPOINT = "https://script.google.com/macros/s/AKfycbwA4TuPi1N7UyPcCPPSnsKOgt0mep0n2H-M1rRz9KUwXGI5kne87D80H1X8FPk6pZU9gg/exec";
+const MAX_SECONDS = 50;
+const TARGET_RATE = 16000;
+
+const recBtn = document.getElementById('recBtn');
+const statusEl = document.getElementById('status');
+const rawEl = document.getElementById('raw');
+const srcEl = document.getElementById('src');
+
+const WORKLET_CODE = `
+class RecProcessor extends AudioWorkletProcessor {
+  constructor(){ super(); this.parts=[]; this.n=0;
+    this.port.onmessage = e => { if(e.data==='flush') this.flush(); }; }
+  flush(){ const m=new Float32Array(this.n); let o=0;
+    for(const p of this.parts){ m.set(p,o); o+=p.length; }
+    this.parts=[]; this.n=0; this.port.postMessage(m,[m.buffer]); }
+  process(inputs){ const ch = inputs[0] && inputs[0][0];
+    if(ch){ this.parts.push(new Float32Array(ch)); this.n+=ch.length; if(this.n>=8192) this.flush(); }
+    return true; }
+}
+registerProcessor('rec-processor', RecProcessor);
+`;
+
+let audioCtx, source, node, stream, recording=false, buffers=[], nativeRate=48000, workletURL=null, wakeLock=null, autoStopTimer=null;
+
+function setStatus(msg, cls=''){ statusEl.className='status '+cls;
+  statusEl.innerHTML = (cls==='live'?'<span class="dot"></span>':'') + msg; }
+
+async function requestWakeLock(){ try{ if('wakeLock' in navigator){ wakeLock = await navigator.wakeLock.request('screen'); } }catch(e){ wakeLock=null; } }
+async function releaseWakeLock(){ try{ if(wakeLock){ await wakeLock.release(); wakeLock=null; } }catch(e){} }
+document.addEventListener('visibilitychange', ()=>{ if(recording && document.visibilityState==='visible') requestWakeLock(); });
+
+recBtn.addEventListener('click', ()=> recording ? stopRec() : startRec());
+document.getElementById('clearBtn').addEventListener('click', ()=>{ rawEl.value=''; });
+document.getElementById('copyBtn').addEventListener('click', ()=>{
+  const text = '【文脈メモ】\n' + srcEl.value.trim() + '\n\n【STT生結果】\n' + rawEl.value.trim();
+  navigator.clipboard.writeText(text).then(()=> setStatus('コピーしました。チャットに貼り付けてください', 'ok'),
+    ()=> setStatus('コピーに失敗。手動で選択してコピーしてください'));
+});
+
+async function startRec(){
+  try{
+    stream = await navigator.mediaDevices.getUserMedia({ audio:{ channelCount:1, echoCancellation:true, noiseSuppression:true } });
+    audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+    await audioCtx.resume();
+    nativeRate = audioCtx.sampleRate;
+    if (!workletURL){ workletURL = URL.createObjectURL(new Blob([WORKLET_CODE], { type:'application/javascript' })); }
+    await audioCtx.audioWorklet.addModule(workletURL);
+    source = audioCtx.createMediaStreamSource(stream);
+    node = new AudioWorkletNode(audioCtx, 'rec-processor');
+    buffers = [];
+    node.port.onmessage = e => { if (e.data && e.data.length) buffers.push(new Float32Array(e.data)); };
+    source.connect(node); node.connect(audioCtx.destination);
+    recording = true; await requestWakeLock();
+    recBtn.textContent='■ 停止して認識'; recBtn.classList.add('rec');
+    setStatus('録音中… 読み上げてください', 'live');
+    autoStopTimer = setTimeout(()=>{ if(recording) stopRec(); }, MAX_SECONDS*1000);
+  }catch(err){ setStatus('マイクを使用できません: '+err.message); }
+}
+
+async function stopRec(){
+  if(!recording) return;
+  recording=false; clearTimeout(autoStopTimer); await releaseWakeLock();
+  recBtn.textContent='● 録音開始'; recBtn.classList.remove('rec');
+  setStatus('認識中…');
+  try{ node.port.postMessage('flush'); }catch(e){}
+  await new Promise(r=>setTimeout(r,120));
+  try{ source.disconnect(); node.disconnect(); }catch(e){}
+  if(stream) stream.getTracks().forEach(t=>t.stop());
+  if(audioCtx) await audioCtx.close();
+
+  const merged = mergeBuffers(buffers);
+  if(merged.length===0){ setStatus('音声が取得できませんでした'); return; }
+  const down = downsample(merged, nativeRate, TARGET_RATE);
+  const b64 = bytesToBase64(new Uint8Array(floatTo16BitPCM(down).buffer));
+  recBtn.disabled = true;
+  await sendRaw(b64);
+  recBtn.disabled = false;
+}
+
+async function sendRaw(pcmBase64){
+  try{
+    const res = await fetch(ENDPOINT, { method:'POST', headers:{ 'Content-Type':'text/plain;charset=utf-8' },
+      body: JSON.stringify({ pcm: pcmBase64, sampleRate: TARGET_RATE, mode:'raw' }) });
+    const data = await res.json();
+    if(data.ok){
+      rawEl.value = (rawEl.value ? rawEl.value.trim()+' ' : '') + (data.transcript||'');
+      setStatus('認識完了 ✓ 続きは再度「録音開始」', 'ok');
+    } else { setStatus('エラー: ' + (data.error||'不明')); }
+  }catch(err){ setStatus('送信失敗: ' + err.message); }
+}
+
+function mergeBuffers(chunks){ let len=0; chunks.forEach(c=>len+=c.length);
+  const out=new Float32Array(len); let off=0; chunks.forEach(c=>{ out.set(c,off); off+=c.length; }); return out; }
+function downsample(buffer,fromRate,toRate){ if(toRate>=fromRate) return buffer;
+  const ratio=fromRate/toRate, newLen=Math.round(buffer.length/ratio); const result=new Float32Array(newLen);
+  let pos=0,idx=0; while(idx<newLen){ const next=Math.round((idx+1)*ratio); let sum=0,c=0;
+    for(let i=pos;i<next&&i<buffer.length;i++){ sum+=buffer[i]; c++; } result[idx]=c?sum/c:0; pos=next; idx++; } return result; }
+function floatTo16BitPCM(input){ const out=new Int16Array(input.length);
+  for(let i=0;i<input.length;i++){ const s=Math.max(-1,Math.min(1,input[i])); out[i]=s<0?s*0x8000:s*0x7FFF; } return out; }
+function bytesToBase64(bytes){ let bin=''; const chunk=0x8000;
+  for(let i=0;i<bytes.length;i+=chunk){ bin+=String.fromCharCode.apply(null, bytes.subarray(i,i+chunk)); } return btoa(bin); }
+</script>
+</body>
+</html>
