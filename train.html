@@ -6,7 +6,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <title>音声日記 トレーニング</title>
 <style>
-  :root { --bg:#0f1115; --card:#1a1d24; --fg:#e8eaed; --sub:#9aa0a6; --accent:#4f8cff; --rec:#ff4d4f; --ok:#34c759; }
+  :root { --bg:#0f1115; --card:#1a1d24; --fg:#e8eaed; --sub:#9aa0a6; --accent:#4f8cff; --rec:#ff4d4f; --ok:#34c759; --warn:#ffb020; }
   * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
   body { margin:0; font-family:-apple-system,"Hiragino Sans","Noto Sans CJK JP",sans-serif;
          background:var(--bg); color:var(--fg); padding:16px; max-width:600px; margin:0 auto; }
@@ -25,12 +25,19 @@
   .status.live { color:var(--rec); } .status.ok { color:var(--ok); }
   .dot { display:inline-block; width:9px; height:9px; border-radius:50%; background:var(--rec); margin-right:6px; animation:blink 1s infinite; }
   @keyframes blink { 50% { opacity:.25; } }
+  .timer { font-size:52px; font-weight:700; text-align:center; font-variant-numeric:tabular-nums;
+           letter-spacing:1px; line-height:1.1; margin:2px 0 2px; color:#3a3f4a; }
+  .timer .max { font-size:16px; font-weight:500; color:var(--sub); }
+  .timer.live { color:var(--rec); }
+  .timer.warn { color:var(--warn); }
+  .timer.done { color:var(--ok); }
+  .timer-cap { text-align:center; font-size:12px; color:var(--sub); margin-bottom:6px; min-height:16px; }
 </style>
 </head>
 <body>
   <h1>🎓 音声日記 トレーニング</h1>
   <p class="lead">
-    ①（任意）「文脈メモ」に話す話題・固有名詞などを書く → ②「録音開始」で自由に話す（1回最長50秒。長ければ停止→開始で区切り）→ ③「生STT結果」に素の認識、「辞書適用後」に本番と同じ補正結果が貯まる → ④「引き継ぎ用にコピー」でチャットへ貼る → 生から新しい誤り→正を抽出し、適用後で残存誤りを検証します。<br>
+    ①（任意）「文脈メモ」に話す話題・固有名詞などを書く → ②「録音開始」で自由に話す（1回最長55秒。長ければ停止→開始で区切り）→ ③「生STT結果」に素の認識、「辞書適用後」に本番と同じ補正結果が貯まる → ④「引き継ぎ用にコピー」でチャットへ貼る → 生から新しい誤り→正を抽出し、適用後で残存誤りを検証します。<br>
     ※ 「辞書適用後」は本番と同一処理（Gemini補正＋置換）。検証用のためDrive保存はしません。
   </p>
 
@@ -38,6 +45,8 @@
   <textarea id="src" rows="3" placeholder="例）QCT初出社、武藤部長、NAQ、重品（重要品質問題）… など今日の話題や固有名詞"></textarea>
 
   <button class="btn" id="recBtn">● 録音開始</button>
+  <div class="timer" id="timer">00:00<span class="max"> / 00:55</span></div>
+  <div class="timer-cap" id="timerCap"></div>
   <div class="status" id="status">マイク許可後、元テキストを読み上げてください。</div>
 
   <label>生STT結果（補正なし・区切り録音で追記）</label>
@@ -54,7 +63,7 @@
 <script>
 // index.html と同じ Apps Script Web アプリ URL
 const ENDPOINT = "https://script.google.com/macros/s/AKfycbwA4TuPi1N7UyPcCPPSnsKOgt0mep0n2H-M1rRz9KUwXGI5kne87D80H1X8FPk6pZU9gg/exec";
-const MAX_SECONDS = 50;
+const MAX_SECONDS = 55;
 const TARGET_RATE = 16000;
 
 const recBtn = document.getElementById('recBtn');
@@ -62,6 +71,25 @@ const statusEl = document.getElementById('status');
 const rawEl = document.getElementById('raw');
 const fixedEl = document.getElementById('fixed');
 const srcEl = document.getElementById('src');
+const timerEl = document.getElementById('timer');
+const timerCapEl = document.getElementById('timerCap');
+
+// 録音タイマー（経過/残り秒を大きく表示）
+let startT = 0, timerInt = null;
+const pad2 = n => String(n).padStart(2,'0');
+const mmss = s => `${pad2(Math.floor(s/60))}:${pad2(Math.floor(s%60))}`;
+function renderTimer(elapsed, cls){
+  const remain = Math.max(0, MAX_SECONDS - elapsed);
+  timerEl.innerHTML = `${mmss(elapsed)}<span class="max"> / ${mmss(MAX_SECONDS)}</span>`;
+  timerEl.className = 'timer' + (cls ? ' ' + cls : '');
+  if (cls === 'live' || cls === 'warn') timerCapEl.textContent = `残り ${Math.ceil(remain)} 秒`;
+}
+function startTimer(){ startT = Date.now(); renderTimer(0, 'live');
+  timerInt = setInterval(() => { const el=(Date.now()-startT)/1000;
+    renderTimer(el, el >= MAX_SECONDS - 10 ? 'warn' : 'live'); }, 200); }
+function stopTimer(){ clearInterval(timerInt); timerInt=null;
+  const el=(Date.now()-startT)/1000; renderTimer(el, 'done');
+  timerCapEl.textContent = `録音時間 ${el.toFixed(1)} 秒`; return el; }
 
 const WORKLET_CODE = `
 class RecProcessor extends AudioWorkletProcessor {
@@ -112,15 +140,18 @@ async function startRec(){
     recording = true; await requestWakeLock();
     recBtn.textContent='■ 停止して認識'; recBtn.classList.add('rec');
     setStatus('録音中… 読み上げてください', 'live');
+    startTimer();
     autoStopTimer = setTimeout(()=>{ if(recording) stopRec(); }, MAX_SECONDS*1000);
   }catch(err){ setStatus('マイクを使用できません: '+err.message); }
 }
 
 async function stopRec(){
   if(!recording) return;
-  recording=false; clearTimeout(autoStopTimer); await releaseWakeLock();
+  recording=false; clearTimeout(autoStopTimer);
+  const recSecs = stopTimer();
+  await releaseWakeLock();
   recBtn.textContent='● 録音開始'; recBtn.classList.remove('rec');
-  setStatus('認識中…');
+  setStatus(`認識中…（録音 ${recSecs.toFixed(1)} 秒）`);
   try{ node.port.postMessage('flush'); }catch(e){}
   await new Promise(r=>setTimeout(r,120));
   try{ source.disconnect(); node.disconnect(); }catch(e){}
