@@ -6,7 +6,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <title>音声日記</title>
 <style>
-  :root { --bg:#0f1115; --card:#1a1d24; --fg:#e8eaed; --sub:#9aa0a6; --accent:#4f8cff; --rec:#ff4d4f; --ok:#34c759; }
+  :root { --bg:#0f1115; --card:#1a1d24; --fg:#e8eaed; --sub:#9aa0a6; --accent:#4f8cff; --rec:#ff4d4f; --ok:#34c759; --warn:#ffb020; }
   * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
   body { margin:0; font-family:-apple-system,"Hiragino Sans","Noto Sans CJK JP",sans-serif;
          background:var(--bg); color:var(--fg); padding:16px; max-width:560px; margin:0 auto; }
@@ -30,6 +30,13 @@
   .dot { display:inline-block; width:9px; height:9px; border-radius:50%; background:var(--rec); margin-right:6px;
          animation:blink 1s infinite; }
   @keyframes blink { 50% { opacity:.25; } }
+  .timer { font-size:52px; font-weight:700; text-align:center; font-variant-numeric:tabular-nums;
+           letter-spacing:1px; line-height:1.1; margin:2px 0 4px; color:#3a3f4a; }
+  .timer .max { font-size:16px; font-weight:500; color:var(--sub); }
+  .timer.live { color:var(--rec); }
+  .timer.warn { color:var(--warn); }
+  .timer.done { color:var(--ok); }
+  .timer-cap { text-align:center; font-size:12px; color:var(--sub); margin-bottom:12px; min-height:16px; }
 </style>
 </head>
 <body>
@@ -37,10 +44,12 @@
   <div class="date" id="today"></div>
 
   <button class="btn" id="recBtn">● 録音を開始</button>
+  <div class="timer" id="timer">00:00<span class="max"> / 00:55</span></div>
+  <div class="timer-cap" id="timerCap"></div>
   <div class="row">
     <button class="btn" id="clearBtn" style="background:#3a3f4a">表示をクリア</button>
   </div>
-  <div class="status" id="status">マイクの使用を許可してください。1回の録音は最長50秒です。</div>
+  <div class="status" id="status">マイクの使用を許可してください。1回の録音は最長55秒です。</div>
 
   <div class="card">
     <h2>今日の記録</h2>
@@ -55,7 +64,7 @@
 <script>
 // ===== 設定: デプロイした Apps Script ウェブアプリのURLに置き換えてください =====
 const ENDPOINT = "https://script.google.com/macros/s/AKfycbwA4TuPi1N7UyPcCPPSnsKOgt0mep0n2H-M1rRz9KUwXGI5kne87D80H1X8FPk6pZU9gg/exec";
-const MAX_SECONDS = 50;        // 同期認識の上限(約60秒)に対する安全マージン
+const MAX_SECONDS = 55;        // 同期認識の上限(約60秒)に対する安全マージン
 const TARGET_RATE = 16000;     // Cloud STT 推奨サンプルレート
 // =============================================================================
 
@@ -68,6 +77,33 @@ const recBtn = document.getElementById('recBtn');
 const clearBtn = document.getElementById('clearBtn');
 const statusEl = document.getElementById('status');
 const transcriptEl = document.getElementById('transcript');
+const timerEl = document.getElementById('timer');
+const timerCapEl = document.getElementById('timerCap');
+
+// 録音タイマー（経過/残り秒を大きく表示）
+let startT = 0, timerInt = null;
+const mmss = s => `${pad(Math.floor(s/60))}:${pad(Math.floor(s%60))}`;
+function renderTimer(elapsed, cls){
+  const remain = Math.max(0, MAX_SECONDS - elapsed);
+  timerEl.innerHTML = `${mmss(elapsed)}<span class="max"> / ${mmss(MAX_SECONDS)}</span>`;
+  timerEl.className = 'timer' + (cls ? ' ' + cls : '');
+  if (cls === 'live') timerCapEl.textContent = `残り ${Math.ceil(remain)} 秒`;
+}
+function startTimer(){
+  startT = Date.now();
+  renderTimer(0, 'live');
+  timerInt = setInterval(() => {
+    const el = (Date.now() - startT) / 1000;
+    renderTimer(el, el >= MAX_SECONDS - 10 ? 'warn' : 'live');
+  }, 200);
+}
+function stopTimer(){
+  clearInterval(timerInt); timerInt = null;
+  const el = (Date.now() - startT) / 1000;
+  renderTimer(el, 'done');
+  timerCapEl.textContent = `録音時間 ${el.toFixed(1)} 秒`;
+  return el;
+}
 
 // AudioWorklet 内で動く録音プロセッサ（専用オーディオスレッドで全サンプルを確実に取得）
 const WORKLET_CODE = `
@@ -130,6 +166,7 @@ async function startRecording() {
     recBtn.textContent = '■ 停止して文字起こし';
     recBtn.classList.add('rec');
     setStatus('録音中… 話してください', true);
+    startTimer();
     autoStopTimer = setTimeout(() => { if (recording) stopRecording(); }, MAX_SECONDS*1000);
   } catch (err) {
     setStatus('マイクを使用できません: ' + err.message);
@@ -140,10 +177,11 @@ async function stopRecording() {
   if (!recording) return;
   recording = false;
   clearTimeout(autoStopTimer);
+  const recSecs = stopTimer();
   await releaseWakeLock();
   recBtn.textContent = '● 録音を開始';
   recBtn.classList.remove('rec');
-  setStatus('文字起こし中…');
+  setStatus(`文字起こし中…（録音 ${recSecs.toFixed(1)} 秒）`);
 
   try { node.port.postMessage('flush'); } catch(e){}
   await new Promise(r=>setTimeout(r,120));
