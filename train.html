@@ -36,13 +36,14 @@
   .meter-fill { height:100%; width:0%; background:var(--ok); border-radius:8px;
                 transition:width .06s linear, background .12s; }
   .meter-cap { text-align:center; font-size:12px; color:var(--sub); min-height:16px; margin-bottom:10px; }
+  .count { font-size:12px; color:var(--sub); text-align:right; margin:2px 2px 0; }
 </style>
 </head>
 <body>
   <h1>🎓 音声日記 トレーニング</h1>
 
   <button class="btn" id="recBtn">● 録音開始</button>
-  <div class="timer" id="timer">00:00<span class="max"> / 00:55</span></div>
+  <div class="timer" id="timer">00:55<span class="max"> / 00:55</span></div>
   <div class="timer-cap" id="timerCap"></div>
   <div class="meter"><div class="meter-fill" id="meterFill"></div></div>
   <div class="meter-cap" id="meterCap"></div>
@@ -50,9 +51,11 @@
 
   <label>生STT結果（補正なし・区切り録音で追記）</label>
   <textarea id="raw" rows="5" placeholder="ここに素のSTT結果が貯まります"></textarea>
+  <div class="count" id="rawCount">0 字</div>
 
   <label>辞書適用後（本番と同じ Gemini補正＋置換）</label>
   <textarea id="fixed" rows="5" placeholder="ここに辞書適用後の結果が貯まります。残る誤りがあれば校正対象"></textarea>
+  <div class="count" id="fixedCount">0 字</div>
 
   <div class="row">
     <button class="btn sub" id="copyBtn">📋 引き継ぎ用にコピー</button>
@@ -73,23 +76,36 @@ const timerEl = document.getElementById('timer');
 const timerCapEl = document.getElementById('timerCap');
 const meterFillEl = document.getElementById('meterFill');
 const meterCapEl = document.getElementById('meterCap');
+const rawCountEl = document.getElementById('rawCount');
+const fixedCountEl = document.getElementById('fixedCount');
 
-// 録音タイマー（経過/残り秒を大きく表示）
+// 区切り録音の累計（総録音時間）と2箱の文字数
+let totalRecSecs = 0;
+function updateCounts(){
+  rawCountEl.textContent = `${rawEl.value.length} 字`;
+  fixedCountEl.textContent = `${fixedEl.value.length} 字`;
+}
+
+// 録音タイマー（残り時間をカウントダウン。残り>10秒=緑, 10〜5秒=黄, 5秒以下=赤）
 let startT = 0, timerInt = null;
 const pad2 = n => String(n).padStart(2,'0');
 const mmss = s => `${pad2(Math.floor(s/60))}:${pad2(Math.floor(s%60))}`;
-function renderTimer(elapsed, cls){
+// 残り秒→色クラス（live=赤 / warn=黄 / done=緑）
+function colorForRemain(remain){ return remain <= 5 ? 'live' : (remain <= 10 ? 'warn' : 'done'); }
+function renderTimer(elapsed, running){
   const remain = Math.max(0, MAX_SECONDS - elapsed);
-  timerEl.innerHTML = `${mmss(elapsed)}<span class="max"> / ${mmss(MAX_SECONDS)}</span>`;
-  timerEl.className = 'timer' + (cls ? ' ' + cls : '');
-  if (cls === 'live' || cls === 'warn') timerCapEl.textContent = `残り ${Math.ceil(remain)} 秒`;
+  timerEl.innerHTML = `${mmss(Math.ceil(remain))}<span class="max"> / ${mmss(MAX_SECONDS)}</span>`;
+  timerEl.className = 'timer' + (running ? ' ' + colorForRemain(remain) : '');
 }
-function startTimer(){ startT = Date.now(); renderTimer(0, 'live');
-  timerInt = setInterval(() => { const el=(Date.now()-startT)/1000;
-    renderTimer(el, el >= MAX_SECONDS - 10 ? 'warn' : 'live'); }, 200); }
+function startTimer(){ startT = Date.now(); renderTimer(0, true);
+  timerInt = setInterval(() => { renderTimer((Date.now()-startT)/1000, true); }, 200); }
 function stopTimer(){ clearInterval(timerInt); timerInt=null;
-  const el=(Date.now()-startT)/1000; renderTimer(el, 'done');
+  const el=(Date.now()-startT)/1000; renderTimer(el, false);
   timerCapEl.textContent = `録音時間 ${el.toFixed(1)} 秒`; return el; }
+// 表示クリア時にタイマーも初期化（満タン表示に戻す）
+function resetTimer(){ clearInterval(timerInt); timerInt=null;
+  timerEl.innerHTML = `${mmss(MAX_SECONDS)}<span class="max"> / ${mmss(MAX_SECONDS)}</span>`;
+  timerEl.className='timer'; timerCapEl.textContent=''; }
 
 // マイク音量インジケーター（録音中の入力レベルを可視化）
 let analyser=null, meterRAF=null;
@@ -139,7 +155,12 @@ async function releaseWakeLock(){ try{ if(wakeLock){ await wakeLock.release(); w
 document.addEventListener('visibilitychange', ()=>{ if(recording && document.visibilityState==='visible') requestWakeLock(); });
 
 recBtn.addEventListener('click', ()=> recording ? stopRec() : startRec());
-document.getElementById('clearBtn').addEventListener('click', ()=>{ rawEl.value=''; fixedEl.value=''; });
+rawEl.addEventListener('input', updateCounts);
+fixedEl.addEventListener('input', updateCounts);
+document.getElementById('clearBtn').addEventListener('click', ()=>{
+  rawEl.value=''; fixedEl.value=''; updateCounts();
+  totalRecSecs = 0; resetTimer();
+});
 document.getElementById('copyBtn').addEventListener('click', ()=>{
   const text = '【STT生結果】\n' + rawEl.value.trim() +
                '\n\n【辞書適用後】\n' + fixedEl.value.trim();
@@ -172,6 +193,8 @@ async function stopRec(){
   if(!recording) return;
   recording=false; clearTimeout(autoStopTimer);
   const recSecs = stopTimer(); stopMeter();
+  totalRecSecs += recSecs;
+  timerCapEl.textContent = `録音 ${recSecs.toFixed(1)} 秒 ／ 総録音 ${totalRecSecs.toFixed(1)} 秒`;
   await releaseWakeLock();
   recBtn.textContent='● 録音開始'; recBtn.classList.remove('rec');
   setStatus(`認識中…（録音 ${recSecs.toFixed(1)} 秒）`);
@@ -198,6 +221,7 @@ async function sendRaw(pcmBase64){
     if(data.ok){
       rawEl.value   = (rawEl.value   ? rawEl.value.trim()+' '   : '') + (data.raw||'');
       fixedEl.value = (fixedEl.value ? fixedEl.value.trim()+' ' : '') + (data.transcript||'');
+      updateCounts();
       setStatus('認識完了 ✓ 続きは再度「録音開始」', 'ok');
     } else { setStatus('エラー: ' + (data.error||'不明')); }
   }catch(err){ setStatus('送信失敗: ' + err.message); }
@@ -213,6 +237,8 @@ function floatTo16BitPCM(input){ const out=new Int16Array(input.length);
   for(let i=0;i<input.length;i++){ const s=Math.max(-1,Math.min(1,input[i])); out[i]=s<0?s*0x8000:s*0x7FFF; } return out; }
 function bytesToBase64(bytes){ let bin=''; const chunk=0x8000;
   for(let i=0;i<bytes.length;i+=chunk){ bin+=String.fromCharCode.apply(null, bytes.subarray(i,i+chunk)); } return btoa(bin); }
+
+updateCounts();
 </script>
 </body>
 </html>
