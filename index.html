@@ -36,7 +36,11 @@
   .timer.live { color:var(--rec); }
   .timer.warn { color:var(--warn); }
   .timer.done { color:var(--ok); }
-  .timer-cap { text-align:center; font-size:12px; color:var(--sub); margin-bottom:12px; min-height:16px; }
+  .timer-cap { text-align:center; font-size:12px; color:var(--sub); margin-bottom:8px; min-height:16px; }
+  .meter { height:16px; background:#2a2e37; border-radius:8px; overflow:hidden; margin:2px 0 4px; }
+  .meter-fill { height:100%; width:0%; background:var(--ok); border-radius:8px;
+                transition:width .06s linear, background .12s; }
+  .meter-cap { text-align:center; font-size:12px; color:var(--sub); min-height:16px; margin-bottom:12px; }
 </style>
 </head>
 <body>
@@ -46,6 +50,8 @@
   <button class="btn" id="recBtn">● 録音を開始</button>
   <div class="timer" id="timer">00:00<span class="max"> / 00:55</span></div>
   <div class="timer-cap" id="timerCap"></div>
+  <div class="meter"><div class="meter-fill" id="meterFill"></div></div>
+  <div class="meter-cap" id="meterCap"></div>
   <div class="row">
     <button class="btn" id="clearBtn" style="background:#3a3f4a">表示をクリア</button>
   </div>
@@ -79,6 +85,8 @@ const statusEl = document.getElementById('status');
 const transcriptEl = document.getElementById('transcript');
 const timerEl = document.getElementById('timer');
 const timerCapEl = document.getElementById('timerCap');
+const meterFillEl = document.getElementById('meterFill');
+const meterCapEl = document.getElementById('meterCap');
 
 // 録音タイマー（経過/残り秒を大きく表示）
 let startT = 0, timerInt = null;
@@ -103,6 +111,31 @@ function stopTimer(){
   renderTimer(el, 'done');
   timerCapEl.textContent = `録音時間 ${el.toFixed(1)} 秒`;
   return el;
+}
+
+// マイク音量インジケーター（録音中の入力レベルを可視化）
+let analyser = null, meterRAF = null;
+function startMeter(){
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 1024;
+  source.connect(analyser);
+  const data = new Uint8Array(analyser.fftSize);
+  const loop = () => {
+    analyser.getByteTimeDomainData(data);
+    let peak = 0;
+    for (let i = 0; i < data.length; i++){ const v = Math.abs((data[i]-128)/128); if (v > peak) peak = v; }
+    const level = Math.min(1, peak);
+    meterFillEl.style.width = Math.round(level*100) + '%';
+    if (level < 0.08){ meterFillEl.style.background = 'var(--sub)'; meterCapEl.textContent = '🔇 入力が小さい…近づく/大きめの声で'; }
+    else if (level > 0.9){ meterFillEl.style.background = 'var(--rec)'; meterCapEl.textContent = '⚠ 音が大きすぎ（歪みの恐れ）'; }
+    else { meterFillEl.style.background = 'var(--ok)'; meterCapEl.textContent = '🎤 入力レベル OK'; }
+    meterRAF = requestAnimationFrame(loop);
+  };
+  loop();
+}
+function stopMeter(){
+  if (meterRAF) cancelAnimationFrame(meterRAF); meterRAF = null; analyser = null;
+  meterFillEl.style.width = '0%'; meterCapEl.textContent = '';
 }
 
 // AudioWorklet 内で動く録音プロセッサ（専用オーディオスレッドで全サンプルを確実に取得）
@@ -166,7 +199,7 @@ async function startRecording() {
     recBtn.textContent = '■ 停止して文字起こし';
     recBtn.classList.add('rec');
     setStatus('録音中… 話してください', true);
-    startTimer();
+    startTimer(); startMeter();
     autoStopTimer = setTimeout(() => { if (recording) stopRecording(); }, MAX_SECONDS*1000);
   } catch (err) {
     setStatus('マイクを使用できません: ' + err.message);
@@ -177,7 +210,7 @@ async function stopRecording() {
   if (!recording) return;
   recording = false;
   clearTimeout(autoStopTimer);
-  const recSecs = stopTimer();
+  const recSecs = stopTimer(); stopMeter();
   await releaseWakeLock();
   recBtn.textContent = '● 録音を開始';
   recBtn.classList.remove('rec');

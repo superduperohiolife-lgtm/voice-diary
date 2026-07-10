@@ -32,21 +32,20 @@
   .timer.warn { color:var(--warn); }
   .timer.done { color:var(--ok); }
   .timer-cap { text-align:center; font-size:12px; color:var(--sub); margin-bottom:6px; min-height:16px; }
+  .meter { height:16px; background:#2a2e37; border-radius:8px; overflow:hidden; margin:2px 0 4px; }
+  .meter-fill { height:100%; width:0%; background:var(--ok); border-radius:8px;
+                transition:width .06s linear, background .12s; }
+  .meter-cap { text-align:center; font-size:12px; color:var(--sub); min-height:16px; margin-bottom:10px; }
 </style>
 </head>
 <body>
   <h1>🎓 音声日記 トレーニング</h1>
-  <p class="lead">
-    ①（任意）「文脈メモ」に話す話題・固有名詞などを書く → ②「録音開始」で自由に話す（1回最長55秒。長ければ停止→開始で区切り）→ ③「生STT結果」に素の認識、「辞書適用後」に本番と同じ補正結果が貯まる → ④「引き継ぎ用にコピー」でチャットへ貼る → 生から新しい誤り→正を抽出し、適用後で残存誤りを検証します。<br>
-    ※ 「辞書適用後」は本番と同一処理（Gemini補正＋置換）。検証用のためDrive保存はしません。
-  </p>
-
-  <label>文脈メモ（任意）：話題・固有名詞など。私の校正精度が上がります</label>
-  <textarea id="src" rows="3" placeholder="例）QCT初出社、武藤部長、NAQ、重品（重要品質問題）… など今日の話題や固有名詞"></textarea>
 
   <button class="btn" id="recBtn">● 録音開始</button>
   <div class="timer" id="timer">00:00<span class="max"> / 00:55</span></div>
   <div class="timer-cap" id="timerCap"></div>
+  <div class="meter"><div class="meter-fill" id="meterFill"></div></div>
+  <div class="meter-cap" id="meterCap"></div>
   <div class="status" id="status">マイク許可後、元テキストを読み上げてください。</div>
 
   <label>生STT結果（補正なし・区切り録音で追記）</label>
@@ -70,9 +69,10 @@ const recBtn = document.getElementById('recBtn');
 const statusEl = document.getElementById('status');
 const rawEl = document.getElementById('raw');
 const fixedEl = document.getElementById('fixed');
-const srcEl = document.getElementById('src');
 const timerEl = document.getElementById('timer');
 const timerCapEl = document.getElementById('timerCap');
+const meterFillEl = document.getElementById('meterFill');
+const meterCapEl = document.getElementById('meterCap');
 
 // 録音タイマー（経過/残り秒を大きく表示）
 let startT = 0, timerInt = null;
@@ -90,6 +90,30 @@ function startTimer(){ startT = Date.now(); renderTimer(0, 'live');
 function stopTimer(){ clearInterval(timerInt); timerInt=null;
   const el=(Date.now()-startT)/1000; renderTimer(el, 'done');
   timerCapEl.textContent = `録音時間 ${el.toFixed(1)} 秒`; return el; }
+
+// マイク音量インジケーター（録音中の入力レベルを可視化）
+let analyser=null, meterRAF=null;
+function startMeter(){
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 1024;
+  source.connect(analyser);
+  const data = new Uint8Array(analyser.fftSize);
+  const loop = () => {
+    analyser.getByteTimeDomainData(data);
+    let peak=0; for(let i=0;i<data.length;i++){ const v=Math.abs((data[i]-128)/128); if(v>peak) peak=v; }
+    const level = Math.min(1, peak);
+    meterFillEl.style.width = Math.round(level*100)+'%';
+    if(level < 0.08){ meterFillEl.style.background='var(--sub)'; meterCapEl.textContent='🔇 入力が小さい…近づく/大きめの声で'; }
+    else if(level > 0.9){ meterFillEl.style.background='var(--rec)'; meterCapEl.textContent='⚠ 音が大きすぎ（歪みの恐れ）'; }
+    else { meterFillEl.style.background='var(--ok)'; meterCapEl.textContent='🎤 入力レベル OK'; }
+    meterRAF = requestAnimationFrame(loop);
+  };
+  loop();
+}
+function stopMeter(){
+  if(meterRAF) cancelAnimationFrame(meterRAF); meterRAF=null; analyser=null;
+  meterFillEl.style.width='0%'; meterCapEl.textContent='';
+}
 
 const WORKLET_CODE = `
 class RecProcessor extends AudioWorkletProcessor {
@@ -117,8 +141,7 @@ document.addEventListener('visibilitychange', ()=>{ if(recording && document.vis
 recBtn.addEventListener('click', ()=> recording ? stopRec() : startRec());
 document.getElementById('clearBtn').addEventListener('click', ()=>{ rawEl.value=''; fixedEl.value=''; });
 document.getElementById('copyBtn').addEventListener('click', ()=>{
-  const text = '【文脈メモ】\n' + srcEl.value.trim() +
-               '\n\n【STT生結果】\n' + rawEl.value.trim() +
+  const text = '【STT生結果】\n' + rawEl.value.trim() +
                '\n\n【辞書適用後】\n' + fixedEl.value.trim();
   navigator.clipboard.writeText(text).then(()=> setStatus('コピーしました。チャットに貼り付けてください', 'ok'),
     ()=> setStatus('コピーに失敗。手動で選択してコピーしてください'));
@@ -140,7 +163,7 @@ async function startRec(){
     recording = true; await requestWakeLock();
     recBtn.textContent='■ 停止して認識'; recBtn.classList.add('rec');
     setStatus('録音中… 読み上げてください', 'live');
-    startTimer();
+    startTimer(); startMeter();
     autoStopTimer = setTimeout(()=>{ if(recording) stopRec(); }, MAX_SECONDS*1000);
   }catch(err){ setStatus('マイクを使用できません: '+err.message); }
 }
@@ -148,7 +171,7 @@ async function startRec(){
 async function stopRec(){
   if(!recording) return;
   recording=false; clearTimeout(autoStopTimer);
-  const recSecs = stopTimer();
+  const recSecs = stopTimer(); stopMeter();
   await releaseWakeLock();
   recBtn.textContent='● 録音開始'; recBtn.classList.remove('rec');
   setStatus(`認識中…（録音 ${recSecs.toFixed(1)} 秒）`);
